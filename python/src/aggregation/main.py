@@ -1,6 +1,6 @@
 import os
 import logging
-import bisect
+import signal
 
 from common import middleware, message_protocol, fruit_item
 
@@ -23,43 +23,65 @@ class AggregationFilter:
         self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
             MOM_HOST, OUTPUT_QUEUE
         )
-        self.fruit_top = []
+        self.amount_by_fruit_by_client = {}
+        self.eofs_by_client = {}    # cant de eofs recibidos por cliente de los sums
 
-    def _process_data(self, fruit, amount):
-        logging.info("Processing data message")
-        for i in range(len(self.fruit_top)):
-            if self.fruit_top[i].fruit == fruit:
-                self.fruit_top[i] = self.fruit_top[i] + fruit_item.FruitItem(
-                    fruit, amount
-                )
-                return
-        bisect.insort(self.fruit_top, fruit_item.FruitItem(fruit, amount))
+        self._closed = False
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
+        
+    def _handle_sigterm(self, signum, frame):
+        logging.info("(AGGREGATION) Received SIGTERM signal")
+        self._closed = True
+        self.input_exchange.stop_consuming()
+        
+    def _close(self):
+        for connection in [self.input_exchange, self.output_queue]:
+            try:
+                connection.close()
+            except middleware.MessageMiddlewareCloseError as e:
+                logging.error(e)
+        
+    def _process_data(self, client_id, fruit, amount):
+        amount_by_fruit = self.amount_by_fruit_by_client.setdefault(client_id, {})
+        amount_by_fruit[fruit] = amount_by_fruit.get(
+            fruit, fruit_item.FruitItem(fruit, 0)
+        ) + fruit_item.FruitItem(fruit, amount)
 
-    def _process_eof(self):
-        logging.info("Received EOF")
-        fruit_chunk = list(self.fruit_top[-TOP_SIZE:])
-        fruit_chunk.reverse()
-        fruit_top = list(
-            map(
-                lambda fruit_item: (fruit_item.fruit, fruit_item.amount),
-                fruit_chunk,
-            )
+    def _process_eof(self, client_id):
+        self.eofs_by_client[client_id] = self.eofs_by_client.get(client_id, 0) + 1 
+        # si recibió eof de todos los Sums de este cliente, manda el top al Join
+        if self.eofs_by_client[client_id] == SUM_AMOUNT:
+            self._send_fruit_top(client_id)
+
+    def _send_fruit_top(self, client_id):
+        # aca ya llegaron todos los eofs de este cliente, podemos borrar el registro de eofs
+        del self.eofs_by_client[client_id]
+        amount_by_fruit = self.amount_by_fruit_by_client.pop(client_id, {})
+        fruit_top = sorted(amount_by_fruit.values())
+        fruit_top.reverse()
+        
+        fruit_top_message = []
+        for final_fruit_item in fruit_top[:TOP_SIZE]:
+            fruit_top_message.append([final_fruit_item.fruit, final_fruit_item.amount])
+        
+        self.output_queue.send(
+            message_protocol.internal.serialize_top(client_id, fruit_top_message)
         )
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
-        del self.fruit_top
-
-    def process_messsage(self, message, ack, nack):
-        logging.info("Process message")
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 2:
-            self._process_data(*fields)
-        else:
-            self._process_eof()
+        logging.info(f"Sent partial top for client {client_id}")
+        
+    def process_message(self, message, ack, nack):
+        msg_type, client_id, args = message_protocol.internal.deserialize(message)
+        if msg_type == message_protocol.internal.MsgType.DATA:
+            self._process_data(client_id, *args)
+        elif msg_type == message_protocol.internal.MsgType.EOF:
+            self._process_eof(client_id)
         ack()
 
     def start(self):
-        self.input_exchange.start_consuming(self.process_messsage)
-
+        try:
+            self.input_exchange.start_consuming(self.process_message)
+        finally:
+            self._close()
 
 def main():
     logging.basicConfig(level=logging.INFO)
